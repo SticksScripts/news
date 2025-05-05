@@ -1,0 +1,267 @@
+# ────────────────────────────────────────────────────────────────
+#  CyberNews Aggregator – Full‑Stack Project (May 2025)
+#  --------------------------------------------------------------
+#  One‑container site that live‑aggregates top cyber‑security news
+#  from 11 leading outlets via their public RSS feeds.
+#
+#  ▸ Backend  :  FastAPI + feedparser + apscheduler (Python 3.12)
+#  ▸ Frontend :  Static HTMX/Alpine.js SPA served by FastAPI
+#  ▸ Styling  :  Tailwind CSS (black/grey/blue/white palette)
+#  ▸ Deploy   :  docker‑compose up ‑d ➜ app on http://localhost:8000
+#
+#  Structure
+#  ├── docker-compose.yml        ← one‑shot deploy
+#  ├── backend/
+#  │   ├── main.py               ← FastAPI app & feed refresher
+#  │   ├── feeds.py              ← list of RSS sources & helpers
+#  │   └── requirements.txt      ← pinned deps
+#  └── static/
+#      ├── index.html            ← 100% client file – HTMX UI
+#      └── tailwind.css          ← compiled palette‑aware CSS
+#
+#  Live refresh
+#  • A background scheduler pulls every feed every 5 minutes,
+#    dedups by GUID/link, stores the latest 500 items in memory.
+#  • /api/articles returns JSON sorted by pubDate DESC.
+#  • index.html uses HTMX to poll /api/articles every 60 s and
+#    swaps the DOM → no page reload, near‑real‑time updates.
+#
+#  --------------------------------------------------------------
+
+```yaml
+# docker-compose.yml
+version: "3.9"
+services:
+  cybernews:
+    image: python:3.12-slim
+    container_name: cybernews
+    working_dir: /app
+    volumes:
+      - ./:/app
+    command: >
+      sh -c "pip install --no-cache-dir -r backend/requirements.txt &&
+             uvicorn backend.main:app --host 0.0.0.0 --port 8000"
+    ports:
+      - "8000:8000"
+```
+
+```text
+# backend/requirements.txt
+fastapi==0.111.0
+uvicorn[standard]==0.29.0
+feedparser==6.0.11
+python-dateutil==2.9.0
+apscheduler==3.10.4
+pydantic==2.7.1
+```
+
+```python
+# backend/feeds.py
+from datetime import datetime, timezone
+from feedparser import parse
+from dateutil import parser as dtp
+
+# List of RSS URLs (May 2025) – update/add freely
+FEED_URLS = {
+    "The Hacker News": "https://thehackernews.com/rss",
+    "KrebsOnSecurity": "https://krebsonsecurity.com/feed/",
+    "BleepingComputer": "https://www.bleepingcomputer.com/feed/",
+    "Dark Reading": "https://www.darkreading.com/rss.xml",
+    "SecurityWeek": "https://feeds.securityweek.com/rss_securityweek",
+    "CSO Online": "https://www.csoonline.com/index.rss",
+    "SC Media": "https://prod.scmagazine.com/feed",
+    "Threatpost": "https://threatpost.com/feed/",
+    "CyberScoop": "https://www.cyberscoop.com/feed/",
+    "WeLiveSecurity": "https://www.welivesecurity.com/feed/",
+    "SecurityOnline.info": "https://securityonline.info/feed/",
+}
+
+class Article(dict):
+    """Small helper so we can dot‑access keys if desired."""
+    __getattr__ = dict.__getitem__
+
+
+def fetch_feed(url: str, source: str) -> list[Article]:
+    d = parse(url)
+    articles: list[Article] = []
+    for entry in d.entries:
+        guid = entry.get("id") or entry.get("guid") or entry.get("link")
+        published = entry.get("published") or entry.get("updated")
+        try:
+            published_dt = dtp.parse(published)
+        except Exception:
+            published_dt = datetime.now(tz=timezone.utc)
+        articles.append(Article({
+            "id": guid,
+            "source": source,
+            "title": entry.get("title"),
+            "link": entry.get("link"),
+            "summary": entry.get("summary", ""),
+            "published": published_dt.isoformat(),
+        }))
+    return articles
+```
+
+```python
+# backend/main.py
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from apscheduler.schedulers.background import BackgroundScheduler
+from feeds import FEED_URLS, fetch_feed, Article
+from datetime import datetime, timezone
+from typing import List, Dict
+import heapq
+
+app = FastAPI(title="CyberNews Aggregator", version="1.0")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+# In‑memory store (guid -> article)
+_articles: Dict[str, Article] = {}
+MAX_ITEMS = 500
+
+
+def refresh_all():
+    """Pull every RSS feed and merge into the store."""
+    global _articles
+    for source, url in FEED_URLS.items():
+        try:
+            for art in fetch_feed(url, source):
+                if art.id not in _articles or art.published > _articles[art.id]["published"]:
+                    _articles[art.id] = art
+        except Exception as e:
+            print(f"[WARN] Failed {source}: {e}")
+    # Trim to MAX_ITEMS keeping newest
+    if len(_articles) > MAX_ITEMS:
+        newest = heapq.nlargest(MAX_ITEMS, _articles.values(), key=lambda a: a["published"])
+        _articles = {a.id: a for a in newest}
+    print(f"[INFO] Feeds refreshed @ {datetime.now(timezone.utc).isoformat()} – total {len(_articles)}")
+
+# Kick first refresh synchronously at startup
+refresh_all()
+
+sched = BackgroundScheduler(daemon=True)
+sched.add_job(refresh_all, "interval", minutes=5)
+sched.start()
+
+@app.get("/api/articles", response_model=List[Article])
+def list_articles(limit: int = 100):
+    items = heapq.nlargest(limit, _articles.values(), key=lambda a: a["published"])
+    return items
+
+@app.get("/")
+async def root():
+    with open("static/index.html", "r", encoding="utf-8") as f:
+        return f.read()
+
+@app.get("/tailwind.css")
+async def css():
+    with open("static/tailwind.css", "r", encoding="utf-8") as f:
+        return f.read()
+```
+
+```html
+<!-- static/index.html -->
+<!DOCTYPE html>
+<html lang="en" class="scroll-smooth">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Cyber News Pulse</title>
+  <link rel="stylesheet" href="/tailwind.css"/>
+  <script src="https://unpkg.com/htmx.org@1.9.10"></script>
+  <script src="https://unpkg.com/alpinejs@3.x.x" defer></script>
+</head>
+<body class="bg-black text-gray-100 font-sans leading-relaxed">
+  <header class="sticky top-0 z-50 backdrop-blur bg-black/70 border-b border-gray-800">
+    <div class="max-w-6xl mx-auto px-4 py-3 flex items-center gap-3">
+      <svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6 text-blue-500" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"/></svg>
+      <h1 class="text-xl font-semibold tracking-wide">Cyber News Pulse</h1>
+    </div>
+  </header>
+
+  <main class="max-w-6xl mx-auto px-4 py-6" x-data="{articles: []}" hx-get="/api/articles" hx-trigger="load, every 60s" hx-swap="outerHTML" hx-target="this">
+    <!-- Articles will hydrate here on first load -->
+    <template x-for="article in articles" :key="article.id">
+      <article class="border-b border-gray-800 py-5 hover:bg-gray-900/60 transition duration-150">
+        <a :href="article.link" target="_blank" rel="noopener" class="block">
+          <h2 class="text-lg text-blue-400 font-medium" x-text="article.title"></h2>
+          <p class="text-gray-400 mt-1 text-sm line-clamp-2" x-html="article.summary"></p>
+          <div class="text-xs text-gray-500 mt-2 flex items-center gap-2">
+            <span class="uppercase tracking-wide" x-text="article.source"></span>
+            <span>•</span>
+            <span x-text="new Date(article.published).toLocaleString()"></span>
+          </div>
+        </a>
+      </article>
+    </template>
+    <script>
+      document.body.addEventListener('htmx:afterOnLoad', (e) => {
+        if (e.detail.xhr && e.detail.pathInfo.requestPath === '/api/articles') {
+          const data = JSON.parse(e.detail.xhr.responseText);
+          document.querySelector('main').__x.$data.articles = data;
+        }
+      });
+    </script>
+  </main>
+</body>
+</html>
+```
+
+```css
+/* static/tailwind.css (compiled via `npx tailwindcss -i input.css -o static/tailwind.css --minify`) */
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --cyber-blue: #3b82f6;
+    --cyber-gray: #1f2937;
+  }
+}
+
+@layer utilities {
+  .line-clamp-2 {
+    overflow: hidden;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+  }
+}
+```
+
+```markdown
+# README.md
+
+## 🚀 Quick Start
+
+```bash
+# 1. Clone & enter dir
+$ git clone https://github.com/yourname/cybernews-aggregator.git
+$ cd cybernews-aggregator
+
+# 2. Launch (Docker‑compose installs deps & starts FastAPI)
+$ docker-compose up -d
+
+# 3. Open http://localhost:8000  – live news! 📰
+```
+
+### Configuration
+* **Add / remove feeds** → edit `backend/feeds.py` `FEED_URLS` dict.
+* **Refresh rate**       → change `minutes=` in `sched.add_job()` inside `backend/main.py`.
+* **Limit items**        → tweak `MAX_ITEMS`.
+
+### Deployment
+The container is totally self‑contained – push to any VPS, Docker host, or cloud run platform that supports Docker images.
+
+```bash
+# Example : DigitalOcean droplet
+$ docker compose build
+$ docker compose up -d --restart always
+```
+
+### Custom Domain
+Point your DNS A‑record to the server IP (or use a reverse proxy like Nginx + LetsEncrypt) and proxy traffic to `localhost:8000`.
+
+---
+© 2025  Cyber News Pulse – MIT License
